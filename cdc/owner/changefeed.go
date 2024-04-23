@@ -25,14 +25,15 @@ import (
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/pkg/errno"
+	"github.com/pingcap/tiflow/cdc/async"
 	"github.com/pingcap/tiflow/cdc/entry"
 	"github.com/pingcap/tiflow/cdc/model"
 	"github.com/pingcap/tiflow/cdc/puller"
 	"github.com/pingcap/tiflow/cdc/redo"
 	"github.com/pingcap/tiflow/cdc/scheduler"
 	"github.com/pingcap/tiflow/cdc/scheduler/schedulepb"
+	"github.com/pingcap/tiflow/cdc/vars"
 	"github.com/pingcap/tiflow/pkg/config"
-	cdcContext "github.com/pingcap/tiflow/pkg/context"
 	cerror "github.com/pingcap/tiflow/pkg/errors"
 	pfilter "github.com/pingcap/tiflow/pkg/filter"
 	"github.com/pingcap/tiflow/pkg/pdutil"
@@ -55,12 +56,12 @@ type Changefeed interface {
 	//
 	// It can be called in etcd ticks, so it should never be blocked.
 	// Tick Returns:  checkpointTs, minTableBarrierTs
-	Tick(cdcContext.Context, *model.ChangeFeedInfo,
+	Tick(context.Context, *model.ChangeFeedInfo,
 		*model.ChangeFeedStatus,
 		map[model.CaptureID]*model.CaptureInfo) (model.Ts, model.Ts)
 
 	// Close closes the changefeed.
-	Close(ctx cdcContext.Context)
+	Close(ctx context.Context)
 
 	// GetScheduler returns the scheduler of this changefeed.
 	GetScheduler() scheduler.Scheduler
@@ -71,13 +72,17 @@ var _ Changefeed = (*changefeed)(nil)
 // newScheduler creates a new scheduler from context.
 // This function is factored out to facilitate unit testing.
 func newScheduler(
-	ctx cdcContext.Context, up *upstream.Upstream, epoch uint64, cfg *config.SchedulerConfig, redoMetaManager redo.MetaManager,
+	ctx context.Context,
+	changeFeedID model.ChangeFeedID,
+	up *upstream.Upstream, epoch uint64,
+	cfg *config.SchedulerConfig,
+	redoMetaManager redo.MetaManager,
+	globalVars *vars.GlobalVars,
 ) (scheduler.Scheduler, error) {
-	changeFeedID := ctx.ChangefeedVars().ID
-	messageServer := ctx.GlobalVars().MessageServer
-	messageRouter := ctx.GlobalVars().MessageRouter
-	ownerRev := ctx.GlobalVars().OwnerRevision
-	captureID := ctx.GlobalVars().CaptureInfo.ID
+	messageServer := globalVars.MessageServer
+	messageRouter := globalVars.MessageRouter
+	ownerRev := globalVars.OwnerRevision
+	captureID := globalVars.CaptureInfo.ID
 	ret, err := scheduler.NewScheduler(
 		ctx, captureID, changeFeedID, messageServer, messageRouter, ownerRev, epoch, up, cfg, redoMetaManager)
 	return ret, errors.Trace(err)
@@ -86,9 +91,10 @@ func newScheduler(
 type changefeed struct {
 	id model.ChangeFeedID
 
-	upstream  *upstream.Upstream
-	cfg       *config.SchedulerConfig
-	scheduler scheduler.Scheduler
+	upstream   *upstream.Upstream
+	cfg        *config.SchedulerConfig
+	scheduler  scheduler.Scheduler
+	globalVars *vars.GlobalVars
 	// barriers will be created when a changefeed is initialized
 	// and will be destroyed when a changefeed is closed.
 	barriers         *barriers
@@ -115,7 +121,9 @@ type changefeed struct {
 	wg sync.WaitGroup
 
 	// state related fields
-	initialized bool
+	initialized *atomic.Bool
+	initializer *async.Initializer
+
 	// isRemoved is true if the changefeed is removed,
 	// which means it will be removed from memory forever
 	isRemoved bool
@@ -160,7 +168,9 @@ type changefeed struct {
 	) DDLSink
 
 	newScheduler func(
-		ctx cdcContext.Context, up *upstream.Upstream, epoch uint64, cfg *config.SchedulerConfig, redoMetaManager redo.MetaManager,
+		ctx context.Context, changefeedID model.ChangeFeedID,
+		up *upstream.Upstream, epoch uint64, cfg *config.SchedulerConfig,
+		redoMetaManager redo.MetaManager, globalVars *vars.GlobalVars,
 	) (scheduler.Scheduler, error)
 
 	newDownstreamObserver func(
@@ -189,6 +199,7 @@ func NewChangefeed(
 	feedStateManager FeedStateManager,
 	up *upstream.Upstream,
 	cfg *config.SchedulerConfig,
+	globalVars *vars.GlobalVars,
 ) *changefeed {
 	c := &changefeed{
 		id:           id,
@@ -207,9 +218,13 @@ func NewChangefeed(
 		newDDLPuller:          puller.NewDDLPuller,
 		newSink:               newDDLSink,
 		newDownstreamObserver: observer.NewObserver,
+		initialized:           atomic.NewBool(false),
+
+		globalVars: globalVars,
 	}
 	c.newScheduler = newScheduler
 	c.cfg = cfg
+	c.initializer = async.NewInitializer(c.initialize)
 	return c
 }
 
@@ -229,8 +244,9 @@ func newChangefeed4Test(
 		changefeedID model.ChangeFeedID, info *model.ChangeFeedInfo,
 		reportError func(err error), reportWarning func(err error),
 	) DDLSink,
-	newScheduler func(
-		ctx cdcContext.Context, up *upstream.Upstream, epoch uint64, cfg *config.SchedulerConfig, redoMetaManager redo.MetaManager,
+	newScheduler func(ctx context.Context, id model.ChangeFeedID,
+		up *upstream.Upstream, epoch uint64, cfg *config.SchedulerConfig, redoMetaManager redo.MetaManager,
+		globalVars *vars.GlobalVars,
 	) (scheduler.Scheduler, error),
 	newDownstreamObserver func(
 		ctx context.Context,
@@ -238,9 +254,10 @@ func newChangefeed4Test(
 		sinkURIStr string, replCfg *config.ReplicaConfig,
 		opts ...observer.NewObserverOption,
 	) (observer.Observer, error),
+	globalVars *vars.GlobalVars,
 ) *changefeed {
 	cfg := config.NewDefaultSchedulerConfig()
-	c := NewChangefeed(id, cfInfo, cfStatus, cfstateManager, up, cfg)
+	c := NewChangefeed(id, cfInfo, cfStatus, cfstateManager, up, cfg, globalVars)
 	c.newDDLPuller = newDDLPuller
 	c.newSink = newSink
 	c.newScheduler = newScheduler
@@ -248,7 +265,7 @@ func newChangefeed4Test(
 	return c
 }
 
-func (c *changefeed) Tick(ctx cdcContext.Context,
+func (c *changefeed) Tick(ctx context.Context,
 	cfInfo *model.ChangeFeedInfo,
 	cfStatus *model.ChangeFeedStatus,
 	captures map[model.CaptureID]*model.CaptureInfo,
@@ -274,17 +291,10 @@ func (c *changefeed) Tick(ctx cdcContext.Context,
 		return 0, 0
 	}
 
-	ctx = cdcContext.WithErrorHandler(ctx, func(err error) error {
-		select {
-		case <-ctx.Done():
-		case c.errCh <- errors.Trace(err):
-		}
-		return nil
-	})
 	checkpointTs, minTableBarrierTs, err := c.tick(ctx, captures)
 
 	// The tick duration is recorded only if changefeed has completed initialization
-	if c.initialized {
+	if c.initialized.Load() {
 		costTime := time.Since(startTime)
 		if costTime > changefeedLogsWarnDuration {
 			log.Warn("changefeed tick took too long",
@@ -302,7 +312,16 @@ func (c *changefeed) Tick(ctx cdcContext.Context,
 	return checkpointTs, minTableBarrierTs
 }
 
-func (c *changefeed) handleErr(ctx cdcContext.Context, err error) {
+func (c *changefeed) Throw(ctx context.Context) func(error) {
+	return func(err error) {
+		select {
+		case <-ctx.Done():
+		case c.errCh <- errors.Trace(err):
+		}
+	}
+}
+
+func (c *changefeed) handleErr(ctx context.Context, err error) {
 	log.Error("an error occurred in Owner",
 		zap.String("namespace", c.id.Namespace),
 		zap.String("changefeed", c.id.ID), zap.Error(err))
@@ -341,7 +360,7 @@ func (c *changefeed) handleWarning(err error) {
 }
 
 func (c *changefeed) checkStaleCheckpointTs(
-	ctx cdcContext.Context, checkpointTs uint64,
+	ctx context.Context, checkpointTs uint64,
 ) error {
 	if c.latestInfo.NeedBlockGC() {
 		failpoint.Inject("InjectChangefeedFastFailError", func() error {
@@ -356,7 +375,7 @@ func (c *changefeed) checkStaleCheckpointTs(
 
 // tick is the main logic of changefeed.
 // tick returns the checkpointTs and minTableBarrierTs.
-func (c *changefeed) tick(ctx cdcContext.Context,
+func (c *changefeed) tick(ctx context.Context,
 	captures map[model.CaptureID]*model.CaptureInfo,
 ) (model.Ts, model.Ts, error) {
 	adminJobPending := c.feedStateManager.Tick(c.resolvedTs, c.latestStatus, c.latestInfo)
@@ -377,8 +396,14 @@ func (c *changefeed) tick(ctx cdcContext.Context,
 		return 0, 0, nil
 	}
 
-	if err := c.initialize(ctx); err != nil {
-		return 0, 0, errors.Trace(err)
+	if !c.initialized.Load() {
+		initialized, err := c.initializer.TryInitialize(ctx, c.globalVars.ChangefeedThreadPool)
+		if err != nil {
+			return 0, 0, errors.Trace(err)
+		}
+		if !initialized {
+			return 0, 0, nil
+		}
 	}
 
 	select {
@@ -497,8 +522,8 @@ func (c *changefeed) tick(ctx cdcContext.Context,
 	return watermark.CheckpointTs, barrier.MinTableBarrierTs, nil
 }
 
-func (c *changefeed) initialize(ctx cdcContext.Context) (err error) {
-	if c.initialized || c.latestStatus == nil {
+func (c *changefeed) initialize(ctx context.Context) (err error) {
+	if c.initialized.Load() || c.latestStatus == nil {
 		// If `c.latestStatus` is nil it means the changefeed struct is just created, it needs to
 		//  1. use startTs as checkpointTs and resolvedTs, if it's a new created changefeed; or
 		//  2. load checkpointTs and resolvedTs from etcd, if it's an existing changefeed.
@@ -555,7 +580,7 @@ LOOP2:
 		ensureTTL := int64(10 * 60)
 		err = gc.EnsureChangefeedStartTsSafety(
 			ctx, c.upstream.PDClient,
-			ctx.GlobalVars().EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceInitializing),
+			c.globalVars.EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceInitializing),
 			c.id, ensureTTL, checkpointTs)
 		if err != nil {
 			return errors.Trace(err)
@@ -563,7 +588,7 @@ LOOP2:
 		// clean service GC safepoint '-creating-' and '-resuming-' if there are any.
 		err = gc.UndoEnsureChangefeedStartTsSafety(
 			ctx, c.upstream.PDClient,
-			ctx.GlobalVars().EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceCreating),
+			c.globalVars.EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceCreating),
 			c.id,
 		)
 		if err != nil {
@@ -571,7 +596,7 @@ LOOP2:
 		}
 		err = gc.UndoEnsureChangefeedStartTsSafety(
 			ctx, c.upstream.PDClient,
-			ctx.GlobalVars().EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceResuming),
+			c.globalVars.EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceResuming),
 			c.id,
 		)
 		if err != nil {
@@ -611,7 +636,7 @@ LOOP2:
 		return errors.Trace(err)
 	}
 
-	cancelCtx, cancel := cdcContext.WithCancel(ctx)
+	cancelCtx, cancel := context.WithCancel(ctx)
 	c.cancel = cancel
 
 	sourceID, err := pdutil.GetSourceID(ctx, c.upstream.PDClient)
@@ -619,13 +644,9 @@ LOOP2:
 		return errors.Trace(err)
 	}
 	c.latestInfo.Config.Sink.TiDBSourceID = sourceID
-	log.Info("set source id",
-		zap.Uint64("sourceID", sourceID),
-		zap.String("namespace", c.id.Namespace),
-		zap.String("changefeed", c.id.ID),
-	)
+	log.Info("get sourceID from PD", zap.Uint64("sourceID", sourceID), zap.Stringer("changefeedID", c.id))
 
-	c.ddlSink = c.newSink(c.id, c.latestInfo, ctx.Throw, func(err error) {
+	c.ddlSink = c.newSink(c.id, c.latestInfo, c.Throw(ctx), func(err error) {
 		select {
 		case <-ctx.Done():
 		case c.warningCh <- err:
@@ -637,7 +658,7 @@ LOOP2:
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		ctx.Throw(c.ddlPuller.Run(cancelCtx))
+		c.Throw(ctx)(c.ddlPuller.Run(cancelCtx))
 	}()
 
 	c.downstreamObserver, err = c.newDownstreamObserver(ctx, c.id, c.latestInfo.SinkURI, c.latestInfo.Config)
@@ -651,7 +672,7 @@ LOOP2:
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
-			ctx.Throw(c.redoDDLMgr.Run(cancelCtx))
+			c.Throw(ctx)(c.redoDDLMgr.Run(cancelCtx))
 		}()
 	}
 
@@ -660,7 +681,7 @@ LOOP2:
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
-			ctx.Throw(c.redoMetaMgr.Run(cancelCtx))
+			c.Throw(ctx)(c.redoMetaMgr.Run(cancelCtx))
 		}()
 		log.Info("owner creates redo manager",
 			zap.String("namespace", c.id.Namespace),
@@ -683,14 +704,14 @@ LOOP2:
 	cfg := *c.cfg
 	cfg.ChangefeedSettings = c.latestInfo.Config.Scheduler
 	epoch := c.latestInfo.Epoch
-	c.scheduler, err = c.newScheduler(ctx, c.upstream, epoch, &cfg, c.redoMetaMgr)
+	c.scheduler, err = c.newScheduler(ctx, c.id, c.upstream, epoch, &cfg, c.redoMetaMgr, c.globalVars)
 	if err != nil {
 		return errors.Trace(err)
 	}
 
 	c.initMetrics()
 
-	c.initialized = true
+	c.initialized.Store(true)
 	c.metricsChangefeedCreateTimeGuage.Set(float64(oracle.GetPhysical(c.latestInfo.CreateTime)))
 	c.metricsChangefeedRestartTimeGauge.Set(float64(oracle.GetPhysical(time.Now())))
 	log.Info("changefeed initialized",
@@ -732,7 +753,8 @@ func (c *changefeed) initMetrics() {
 }
 
 // releaseResources is idempotent.
-func (c *changefeed) releaseResources(ctx cdcContext.Context) {
+func (c *changefeed) releaseResources(ctx context.Context) {
+	c.initializer.Terminate()
 	c.cleanupMetrics()
 	if c.isReleased {
 		return
@@ -742,7 +764,9 @@ func (c *changefeed) releaseResources(ctx cdcContext.Context) {
 	c.cleanupRedoManager(ctx)
 	c.cleanupChangefeedServiceGCSafePoints(ctx)
 
-	c.cancel()
+	if c.cancel != nil {
+		c.cancel()
+	}
 	c.cancel = func() {}
 
 	if c.ddlPuller != nil {
@@ -774,7 +798,7 @@ func (c *changefeed) releaseResources(ctx cdcContext.Context) {
 	c.schema = nil
 	c.barriers = nil
 	c.resolvedTs = 0
-	c.initialized = false
+	c.initialized.Store(false)
 	c.isReleased = true
 
 	log.Info("changefeed closed",
@@ -836,15 +860,15 @@ func (c *changefeed) cleanupRedoManager(ctx context.Context) {
 	}
 }
 
-func (c *changefeed) cleanupChangefeedServiceGCSafePoints(ctx cdcContext.Context) {
+func (c *changefeed) cleanupChangefeedServiceGCSafePoints(ctx context.Context) {
 	if !c.isRemoved {
 		return
 	}
 
 	serviceIDs := []string{
-		ctx.GlobalVars().EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceCreating),
-		ctx.GlobalVars().EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceResuming),
-		ctx.GlobalVars().EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceInitializing),
+		c.globalVars.EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceCreating),
+		c.globalVars.EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceResuming),
+		c.globalVars.EtcdClient.GetEnsureGCServiceID(gc.EnsureGCServiceInitializing),
 	}
 
 	for _, serviceID := range serviceIDs {
@@ -864,7 +888,7 @@ func (c *changefeed) cleanupChangefeedServiceGCSafePoints(ctx cdcContext.Context
 
 // handleBarrier calculates the barrierTs of the changefeed.
 // barrierTs is used to control the data that can be flush to downstream.
-func (c *changefeed) handleBarrier(ctx cdcContext.Context,
+func (c *changefeed) handleBarrier(ctx context.Context,
 	cfInfo *model.ChangeFeedInfo,
 	cfStatus *model.ChangeFeedStatus,
 	barrier *schedulepb.BarrierWithMinTs,
@@ -934,7 +958,7 @@ func (c *changefeed) updateMetrics(currentTs int64, checkpointTs, resolvedTs mod
 	c.metricsCurrentPDTsGauge.Set(float64(currentTs))
 }
 
-func (c *changefeed) Close(ctx cdcContext.Context) {
+func (c *changefeed) Close(ctx context.Context) {
 	startTime := time.Now()
 	c.releaseResources(ctx)
 

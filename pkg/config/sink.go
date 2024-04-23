@@ -89,6 +89,12 @@ const (
 	// DefaultSendBootstrapToAllPartition is the default value of
 	// whether to send bootstrap message to all partitions.
 	DefaultSendBootstrapToAllPartition = true
+
+	// DefaultMaxReconnectToPulsarBroker is the default max reconnect times to pulsar broker.
+	// The pulsar client uses an exponential backoff with jitter to reconnect to the broker.
+	// Based on test, when the max reconnect times is 3,
+	// the total time of reconnecting to brokers is about 30 seconds.
+	DefaultMaxReconnectToPulsarBroker = 3
 )
 
 // AtomicityLevel represents the atomicity level of a changefeed.
@@ -162,7 +168,6 @@ type SinkConfig struct {
 	// which is used to set the `tidb_cdc_write_source` session variable.
 	// Note: This field is only used internally and only used in the MySQL sink.
 	TiDBSourceID uint64 `toml:"-" json:"-"`
-
 	// SafeMode is only available when the downstream is DB.
 	SafeMode           *bool               `toml:"safe-mode" json:"safe-mode,omitempty"`
 	KafkaConfig        *KafkaConfig        `toml:"kafka-config" json:"kafka-config,omitempty"`
