@@ -121,6 +121,10 @@ func KafkaGoConsume(ctx context.Context, consumer *Consumer, wg *sync.WaitGroup)
 		for topic, assignments := range gen.Assignments {
 			for _, assignment := range assignments {
 				partition, offset := assignment.ID, assignment.Offset
+				log.Info("start consume claim",
+					zap.String("topic", topic), zap.Int("partition", partition),
+					zap.Int64("initialOffset", offset))
+
 				gen.Start(func(ctx context.Context) {
 					reader := kafka.NewReader(kafka.ReaderConfig{
 						Brokers:   consumerOption.address,
@@ -131,31 +135,37 @@ func KafkaGoConsume(ctx context.Context, consumer *Consumer, wg *sync.WaitGroup)
 
 					// seek to the last committed offset for this partition.
 					reader.SetOffset(offset)
-					for {
-						msg, err := reader.ReadMessage(ctx)
-						if err != nil {
-							if errors.Is(err, kafka.ErrGenerationEnded) {
-								// generation has ended.  commit offsets.  in a real app,
-								// offsets would be committed periodically.
-								gen.CommitOffsets(map[string]map[int]int64{topic: {partition: offset + 1}})
-								return
-							} else {
-								log.Panic("Error reading message", zap.Error(err))
-							}
-						} else {
-							err = consumer.KafkaConsume(int32(partition), func(handle HandleFunc) error {
-								err := handle(msg.Key, msg.Value, func() {
-								})
-								if err != nil {
-									return err
-								}
-								return nil
-							})
+					msgChan := make(chan kafka.Message, 256)
+
+					go func() {
+						for {
+							msg, err := reader.ReadMessage(ctx)
 							if err != nil {
-								log.Panic("Error from consumer", zap.Error(err))
+								if errors.Is(err, kafka.ErrGenerationEnded) {
+									// generation has ended.  commit offsets.  in a real app,
+									// offsets would be committed periodically.
+									gen.CommitOffsets(map[string]map[int]int64{topic: {partition: offset + 1}})
+									return
+								} else {
+									log.Panic("Error reading message", zap.Error(err))
+								}
+							} else {
+								msgChan <- msg
+								offset = msg.Offset
 							}
-							offset = msg.Offset
 						}
+					}()
+					err = consumer.KafkaConsume(int32(partition), func(handle HandleFunc) error {
+						for message := range msgChan {
+							err := handle(message.Key, message.Value, func() {})
+							if err != nil {
+								return err
+							}
+						}
+						return nil
+					})
+					if err != nil {
+						log.Panic("Error from consumer", zap.Error(err))
 					}
 				})
 			}

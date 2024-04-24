@@ -250,7 +250,6 @@ func main() {
 	if err != nil {
 		log.Panic("adjust consumer option failed", zap.Error(err))
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	consumer, err := NewConsumer(ctx, consumerOption)
 	if err != nil {
@@ -839,7 +838,6 @@ func (c *Consumer) KafkaConsume(partition int32, handleMessage func(HandleFunc) 
 	eventGroups := make(map[int64]*eventsGroup)
 
 	err = handleMessage(func(key, val []byte, handleCallBack func()) error {
-		// log.Info("message key value", zap.String("key", string(key)), zap.String("value", string(val)))
 		return c.handleMessage(decoder, partition, sink, key, val, eventGroups, handleCallBack)
 	})
 	if err != nil {
