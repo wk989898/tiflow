@@ -15,6 +15,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,14 +92,20 @@ func KafkaGoConsume(ctx context.Context, consumer *Consumer, wg *sync.WaitGroup)
 	if err != nil {
 		log.Panic("wait topic created failed", zap.Error(err))
 	}
+	topics := strings.Split(consumerOption.topic, ",")
+	if len(topics) == 0 {
+		log.Panic("no topics provided")
+		return
+	}
 	client, err := kafka.NewConsumerGroup(kafka.ConsumerGroupConfig{
 		ID:      consumerOption.groupID,
 		Brokers: consumerOption.address,
-		Topics:  []string{consumerOption.topic},
+		Topics:  topics,
 	})
 	if err != nil {
 		log.Panic("Error creating consumer group client", zap.Error(err))
 	}
+
 	defer func() {
 		if err = client.Close(); err != nil {
 			log.Panic("Error closing client", zap.Error(err))
@@ -108,16 +116,12 @@ func KafkaGoConsume(ctx context.Context, consumer *Consumer, wg *sync.WaitGroup)
 	for {
 		gen, err := client.Next(context.Background())
 		if err != nil {
-			break
+			return
 		}
-		var wg sync.WaitGroup
 		for topic, assignments := range gen.Assignments {
 			for _, assignment := range assignments {
 				partition, offset := assignment.ID, assignment.Offset
-				wg.Add(1)
 				gen.Start(func(ctx context.Context) {
-					defer wg.Done()
-					// create reader for this partition.
 					reader := kafka.NewReader(kafka.ReaderConfig{
 						Brokers:   consumerOption.address,
 						Topic:     topic,
@@ -127,24 +131,23 @@ func KafkaGoConsume(ctx context.Context, consumer *Consumer, wg *sync.WaitGroup)
 
 					// seek to the last committed offset for this partition.
 					reader.SetOffset(offset)
-					var msgs []kafka.Message
 					for {
 						msg, err := reader.ReadMessage(ctx)
-						switch err {
-						case kafka.ErrGenerationEnded:
-							// generation has ended.  commit offsets.  in a real app,
-							// offsets would be committed periodically.
-							gen.CommitOffsets(map[string]map[int]int64{"my-topic": {partition: offset}})
-							return
-						case nil:
+						if err != nil {
+							if errors.Is(err, kafka.ErrGenerationEnded) {
+								// generation has ended.  commit offsets.  in a real app,
+								// offsets would be committed periodically.
+								gen.CommitOffsets(map[string]map[int]int64{topic: {partition: offset + 1}})
+								return
+							} else {
+								log.Panic("Error reading message", zap.Error(err))
+							}
+						} else {
 							err = consumer.KafkaConsume(int32(partition), func(handle HandleFunc) error {
-								for _, message := range msgs {
-									err := handle(message.Key, message.Value, func() {
-										// gen.CommitOffsets()
-									})
-									if err != nil {
-										return err
-									}
+								err := handle(msg.Key, msg.Value, func() {
+								})
+								if err != nil {
+									return err
 								}
 								return nil
 							})
@@ -152,14 +155,10 @@ func KafkaGoConsume(ctx context.Context, consumer *Consumer, wg *sync.WaitGroup)
 								log.Panic("Error from consumer", zap.Error(err))
 							}
 							offset = msg.Offset
-						default:
-							log.Panic("Error reading message", zap.Error(err))
 						}
 					}
 				})
 			}
 		}
-		// wait for consumers to exit
-		wg.Wait()
 	}
 }

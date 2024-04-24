@@ -174,7 +174,7 @@ func newDDLManager(
 // 4. send DDLEvents to redo log.
 // 5. adds the DDLEvents to the ddlHandler.pendingDDLs
 // 6. iterates the ddlHandler.pendingDDLs, find next DDL event to be executed.
-// 7.checks if checkpointTs reach next ddl commitTs, if so, execute the ddl.
+// 7. checks if checkpointTs reach next ddl commitTs, if so, execute the ddl.
 // 8. removes the executed DDL events from executingDDL and pendingDDLs.
 func (m *ddlManager) tick(
 	ctx context.Context,

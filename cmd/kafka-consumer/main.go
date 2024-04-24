@@ -34,7 +34,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/google/uuid"
 	cerror "github.com/pingcap/errors"
 	"github.com/pingcap/log"
@@ -49,7 +48,6 @@ import (
 	"github.com/pingcap/tiflow/pkg/filter"
 	"github.com/pingcap/tiflow/pkg/logutil"
 	"github.com/pingcap/tiflow/pkg/quotes"
-	"github.com/pingcap/tiflow/pkg/security"
 	"github.com/pingcap/tiflow/pkg/sink/codec"
 	"github.com/pingcap/tiflow/pkg/sink/codec/avro"
 	"github.com/pingcap/tiflow/pkg/sink/codec/canal"
@@ -104,7 +102,7 @@ type consumerOption struct {
 }
 
 // Adjust the consumer option by the upstream uri passed in parameters.
-func (o *consumerOption) Adjust(upstreamURI *url.URL, configFile string) error {
+func (o *consumerOption) Adjust(upstreamURI *url.URL, configFile string, getPartitionNum func(address []string, topic string) (int32, error)) error {
 	s := upstreamURI.Query().Get("version")
 	if s != "" {
 		o.version = s
@@ -242,34 +240,21 @@ func main() {
 		log.Panic("invalid upstream-uri scheme, the scheme of upstream-uri must be `kafka`",
 			zap.String("upstreamURI", upstreamURIStr))
 	}
+	// HACK
+	// getPartitionNum := SaramGetPartitionNum
+	// Consume := SaramConsume
+	getPartitionNum := KafkaGoGetPartitionNum
+	Consume := KafkaGoConsume
 
-	err = consumerOption.Adjust(upstreamURI, configFile)
+	err = consumerOption.Adjust(upstreamURI, configFile, getPartitionNum)
 	if err != nil {
 		log.Panic("adjust consumer option failed", zap.Error(err))
-	}
-
-	///**
-	// * Construct a new Sarama configuration.
-	// * The Kafka cluster version has to be defined before the consumer/producer is initialized.
-	// */
-	config, err := newSaramaConfig(consumerOption)
-	if err != nil {
-		log.Panic("Error creating sarama config", zap.Error(err))
-	}
-	err = waitTopicCreated(consumerOption.address, consumerOption.topic, config)
-	if err != nil {
-		log.Panic("wait topic created failed", zap.Error(err))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	consumer, err := NewConsumer(ctx, consumerOption)
 	if err != nil {
 		log.Panic("Error creating consumer", zap.Error(err))
-	}
-
-	client, err := sarama.NewConsumerGroup(consumerOption.address, consumerOption.groupID, config)
-	if err != nil {
-		log.Panic("Error creating consumer group client", zap.Error(err))
 	}
 
 	var wg sync.WaitGroup
@@ -282,24 +267,8 @@ func main() {
 			}
 		}()
 	}
-
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			// `consume` should be called inside an infinite loop, when a
-			// server-side rebalance happens, the consumer session will need to be
-			// recreated to get the new claims
-			if err := client.Consume(ctx, strings.Split(consumerOption.topic, ","), consumer); err != nil {
-				log.Panic("Error from consumer", zap.Error(err))
-			}
-			// check if context was cancelled, signaling that the consumer should stop
-			if ctx.Err() != nil {
-				return
-			}
-			consumer.ready = make(chan bool)
-		}
-	}()
+	go Consume(ctx, consumer, &wg)
 
 	go func() {
 		if err := consumer.Run(ctx); err != nil {
@@ -322,85 +291,6 @@ func main() {
 	}
 	cancel()
 	wg.Wait()
-	if err = client.Close(); err != nil {
-		log.Panic("Error closing client", zap.Error(err))
-	}
-}
-
-func getPartitionNum(address []string, topic string) (int32, error) {
-	saramaConfig := sarama.NewConfig()
-	// get partition number or create topic automatically
-	admin, err := sarama.NewClusterAdmin(address, saramaConfig)
-	if err != nil {
-		return 0, cerror.Trace(err)
-	}
-	topics, err := admin.ListTopics()
-	if err != nil {
-		return 0, cerror.Trace(err)
-	}
-	err = admin.Close()
-	if err != nil {
-		return 0, cerror.Trace(err)
-	}
-	topicDetail, exist := topics[topic]
-	if !exist {
-		return 0, cerror.Errorf("can not find topic %s", topic)
-	}
-	log.Info("get partition number of topic",
-		zap.String("topic", topic),
-		zap.Int32("partitionNum", topicDetail.NumPartitions))
-	return topicDetail.NumPartitions, nil
-}
-
-func waitTopicCreated(address []string, topic string, cfg *sarama.Config) error {
-	admin, err := sarama.NewClusterAdmin(address, cfg)
-	if err != nil {
-		return cerror.Trace(err)
-	}
-	defer admin.Close()
-	for i := 0; i <= 30; i++ {
-		topics, err := admin.ListTopics()
-		if err != nil {
-			return cerror.Trace(err)
-		}
-		if _, ok := topics[topic]; ok {
-			return nil
-		}
-		log.Info("wait the topic created", zap.String("topic", topic))
-		time.Sleep(1 * time.Second)
-	}
-	return cerror.Errorf("wait the topic(%s) created timeout", topic)
-}
-
-func newSaramaConfig(o *consumerOption) (*sarama.Config, error) {
-	config := sarama.NewConfig()
-
-	version, err := sarama.ParseKafkaVersion(o.version)
-	if err != nil {
-		return nil, cerror.Trace(err)
-	}
-
-	config.ClientID = "ticdc_kafka_sarama_consumer"
-	config.Version = version
-
-	config.Metadata.Retry.Max = 10000
-	config.Metadata.Retry.Backoff = 500 * time.Millisecond
-	config.Consumer.Retry.Backoff = 500 * time.Millisecond
-	config.Consumer.Offsets.Initial = sarama.OffsetOldest
-
-	if len(o.ca) != 0 {
-		config.Net.TLS.Enable = true
-		config.Net.TLS.Config, err = (&security.Credential{
-			CAPath:   o.ca,
-			CertPath: o.cert,
-			KeyPath:  o.key,
-		}).ToTLSConfig()
-		if err != nil {
-			return nil, cerror.Trace(err)
-		}
-	}
-
-	return config, err
 }
 
 // partitionSinks maintained for each partition, it may sync data for multiple tables.
@@ -502,18 +392,6 @@ func NewConsumer(ctx context.Context, o *consumerOption) (*Consumer, error) {
 	return c, nil
 }
 
-// Setup is run at the beginning of a new session, before ConsumeClaim
-func (c *Consumer) Setup(sarama.ConsumerGroupSession) error {
-	// Mark the c as ready
-	close(c.ready)
-	return nil
-}
-
-// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
-func (c *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
-	return nil
-}
-
 type eventsGroup struct {
 	events []*model.RowChangedEvent
 }
@@ -540,227 +418,6 @@ func (g *eventsGroup) Resolve(resolveTs uint64) []*model.RowChangedEvent {
 	g.events = g.events[i:]
 
 	return result
-}
-
-// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
-func (c *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	partition := claim.Partition()
-	c.sinksMu.Lock()
-	sink := c.sinks[partition]
-	c.sinksMu.Unlock()
-	if sink == nil {
-		panic("sink should initialized")
-	}
-
-	ctx := context.Background()
-	var (
-		decoder codec.RowEventDecoder
-		err     error
-	)
-
-	switch c.option.protocol {
-	case config.ProtocolOpen, config.ProtocolDefault:
-		decoder, err = open.NewBatchDecoder(ctx, c.option.codecConfig, c.upstreamTiDB)
-	case config.ProtocolCanalJSON:
-		decoder, err = canal.NewBatchDecoder(ctx, c.option.codecConfig, c.upstreamTiDB)
-		if err != nil {
-			return err
-		}
-	case config.ProtocolAvro:
-		schemaM, err := avro.NewConfluentSchemaManager(ctx, c.option.schemaRegistryURI, nil)
-		if err != nil {
-			return cerror.Trace(err)
-		}
-		decoder = avro.NewDecoder(c.option.codecConfig, schemaM, c.option.topic)
-	case config.ProtocolSimple:
-		decoder, err = simple.NewDecoder(ctx, c.option.codecConfig, c.upstreamTiDB)
-	default:
-		log.Panic("Protocol not supported", zap.Any("Protocol", c.option.protocol))
-	}
-	if err != nil {
-		return cerror.Trace(err)
-	}
-
-	log.Info("start consume claim",
-		zap.String("topic", claim.Topic()), zap.Int32("partition", partition),
-		zap.Int64("initialOffset", claim.InitialOffset()), zap.Int64("highWaterMarkOffset", claim.HighWaterMarkOffset()))
-
-	eventGroups := make(map[int64]*eventsGroup)
-	for message := range claim.Messages() {
-		if err = decoder.AddKeyValue(message.Key, message.Value); err != nil {
-			log.Error("add key value to the decoder failed", zap.Error(err))
-			return cerror.Trace(err)
-		}
-
-		counter := 0
-		for {
-			tp, hasNext, err := decoder.HasNext()
-			if err != nil {
-				log.Panic("decode message key failed", zap.Error(err))
-			}
-			if !hasNext {
-				break
-			}
-
-			counter++
-			// If the message containing only one event exceeds the length limit, CDC will allow it and issue a warning.
-			if len(message.Key)+len(message.Value) > c.option.maxMessageBytes && counter > 1 {
-				log.Panic("kafka max-messages-bytes exceeded",
-					zap.Int("max-message-bytes", c.option.maxMessageBytes),
-					zap.Int("receivedBytes", len(message.Key)+len(message.Value)))
-			}
-
-			switch tp {
-			case model.MessageTypeDDL:
-				// for some protocol, DDL would be dispatched to all partitions,
-				// Consider that DDL a, b, c received from partition-0, the latest DDL is c,
-				// if we receive `a` from partition-1, which would be seemed as DDL regression,
-				// then cause the consumer panic, but it was a duplicate one.
-				// so we only handle DDL received from partition-0 should be enough.
-				// but all DDL event messages should be consumed.
-				ddl, err := decoder.NextDDLEvent()
-				if err != nil {
-					log.Panic("decode message value failed",
-						zap.ByteString("value", message.Value),
-						zap.Error(err))
-				}
-
-				if simple, ok := decoder.(*simple.Decoder); ok {
-					cachedEvents := simple.GetCachedEvents()
-					for _, row := range cachedEvents {
-						var partitionID int64
-						if row.TableInfo.IsPartitionTable() {
-							partitionID = row.PhysicalTableID
-						}
-						tableID := c.fakeTableIDGenerator.
-							generateFakeTableID(row.TableInfo.GetSchemaName(), row.TableInfo.GetTableName(), partitionID)
-						row.TableInfo.TableName.TableID = tableID
-
-						group, ok := eventGroups[tableID]
-						if !ok {
-							group = newEventsGroup()
-							eventGroups[tableID] = group
-						}
-						group.Append(row)
-					}
-				}
-
-				// the Query maybe empty if using simple protocol, it's comes from `bootstrap` event.
-				if partition == 0 && ddl.Query != "" {
-					c.appendDDL(ddl)
-				}
-				// todo: mark the offset after the DDL is fully synced to the downstream mysql.
-				session.MarkMessage(message, "")
-			case model.MessageTypeRow:
-				row, err := decoder.NextRowChangedEvent()
-				if err != nil {
-					log.Panic("decode message value failed",
-						zap.ByteString("value", message.Value),
-						zap.Error(err))
-				}
-				// when using simple protocol, the row may be nil, since it's table info not received yet,
-				// it's cached in the decoder, so just continue here.
-				if row == nil {
-					continue
-				}
-				target, _, err := c.eventRouter.GetPartitionForRowChange(row, c.option.partitionNum)
-				if err != nil {
-					return cerror.Trace(err)
-				}
-				if partition != target {
-					log.Panic("RowChangedEvent dispatched to wrong partition",
-						zap.Int32("obtained", partition),
-						zap.Int32("expected", target),
-						zap.Int32("partitionNum", c.option.partitionNum),
-						zap.Any("row", row),
-					)
-				}
-
-				globalResolvedTs := atomic.LoadUint64(&c.globalResolvedTs)
-				partitionResolvedTs := atomic.LoadUint64(&sink.resolvedTs)
-				if row.CommitTs <= globalResolvedTs || row.CommitTs <= partitionResolvedTs {
-					log.Warn("RowChangedEvent fallback row, ignore it",
-						zap.Uint64("commitTs", row.CommitTs),
-						zap.Uint64("globalResolvedTs", globalResolvedTs),
-						zap.Uint64("partitionResolvedTs", partitionResolvedTs),
-						zap.Int32("partition", partition),
-						zap.Any("row", row))
-					// todo: mark the offset after the DDL is fully synced to the downstream mysql.
-					session.MarkMessage(message, "")
-					continue
-				}
-				var partitionID int64
-				if row.TableInfo.IsPartitionTable() {
-					partitionID = row.PhysicalTableID
-				}
-				tableID := c.fakeTableIDGenerator.
-					generateFakeTableID(row.TableInfo.GetSchemaName(), row.TableInfo.GetTableName(), partitionID)
-				row.TableInfo.TableName.TableID = tableID
-
-				group, ok := eventGroups[tableID]
-				if !ok {
-					group = newEventsGroup()
-					eventGroups[tableID] = group
-				}
-
-				group.Append(row)
-				// todo: mark the offset after the DDL is fully synced to the downstream mysql.
-				session.MarkMessage(message, "")
-			case model.MessageTypeResolved:
-				ts, err := decoder.NextResolvedEvent()
-				if err != nil {
-					log.Panic("decode message value failed",
-						zap.ByteString("value", message.Value),
-						zap.Error(err))
-				}
-
-				globalResolvedTs := atomic.LoadUint64(&c.globalResolvedTs)
-				partitionResolvedTs := atomic.LoadUint64(&sink.resolvedTs)
-				if ts < globalResolvedTs || ts < partitionResolvedTs {
-					log.Warn("partition resolved ts fallback, skip it",
-						zap.Uint64("ts", ts),
-						zap.Uint64("partitionResolvedTs", partitionResolvedTs),
-						zap.Uint64("globalResolvedTs", globalResolvedTs),
-						zap.Int32("partition", partition))
-					session.MarkMessage(message, "")
-					continue
-				}
-
-				for tableID, group := range eventGroups {
-					events := group.Resolve(ts)
-					if len(events) == 0 {
-						continue
-					}
-					if _, ok := sink.tableSinksMap.Load(tableID); !ok {
-						sink.tableSinksMap.Store(tableID, c.sinkFactory.CreateTableSinkForConsumer(
-							model.DefaultChangeFeedID("kafka-consumer"),
-							spanz.TableIDToComparableSpan(tableID),
-							events[0].CommitTs,
-						))
-					}
-					s, _ := sink.tableSinksMap.Load(tableID)
-					s.(tablesink.TableSink).AppendRowChangedEvents(events...)
-					commitTs := events[len(events)-1].CommitTs
-					lastCommitTs, ok := sink.tablesCommitTsMap.Load(tableID)
-					if !ok || lastCommitTs.(uint64) < commitTs {
-						sink.tablesCommitTsMap.Store(tableID, commitTs)
-					}
-				}
-				atomic.StoreUint64(&sink.resolvedTs, ts)
-				// todo: mark the offset after the DDL is fully synced to the downstream mysql.
-				session.MarkMessage(message, "")
-
-			}
-
-		}
-
-		if counter > c.option.maxBatchSize {
-			log.Panic("Open Protocol max-batch-size exceeded", zap.Int("max-batch-size", c.option.maxBatchSize),
-				zap.Int("actual-batch-size", counter))
-		}
-	}
-
-	return nil
 }
 
 // append DDL wait to be handled, only consider the constraint among DDLs.
@@ -964,4 +621,229 @@ func openDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	}
 	log.Info("open db success", zap.String("dsn", dsn))
 	return db, nil
+}
+
+type HandleFunc func(key, val []byte, handleCallBack func()) error
+
+func (c *Consumer) handleMessage(decoder codec.RowEventDecoder, partition int32, sink *partitionSinks, key []byte, value []byte, eventGroups map[int64]*eventsGroup, handleCallBack func()) error {
+	if err := decoder.AddKeyValue(key, value); err != nil {
+		log.Error("add key value to the decoder failed", zap.Error(err))
+		return cerror.Trace(err)
+	}
+
+	counter := 0
+	for {
+		tp, hasNext, err := decoder.HasNext()
+		if err != nil {
+			log.Panic("decode message key failed", zap.Error(err))
+		}
+		if !hasNext {
+			break
+		}
+
+		counter++
+		// If the message containing only one event exceeds the length limit, CDC will allow it and issue a warning.
+		if len(key)+len(value) > c.option.maxMessageBytes && counter > 1 {
+			log.Panic("kafka max-messages-bytes exceeded",
+				zap.Int("max-message-bytes", c.option.maxMessageBytes),
+				zap.Int("receivedBytes", len(key)+len(value)))
+		}
+
+		switch tp {
+		case model.MessageTypeDDL:
+			// for some protocol, DDL would be dispatched to all partitions,
+			// Consider that DDL a, b, c received from partition-0, the latest DDL is c,
+			// if we receive `a` from partition-1, which would be seemed as DDL regression,
+			// then cause the consumer panic, but it was a duplicate one.
+			// so we only handle DDL received from partition-0 should be enough.
+			// but all DDL event messages should be consumed.
+			ddl, err := decoder.NextDDLEvent()
+			if err != nil {
+				log.Panic("decode message value failed",
+					zap.ByteString("value", value),
+					zap.Error(err))
+			}
+
+			if simple, ok := decoder.(*simple.Decoder); ok {
+				cachedEvents := simple.GetCachedEvents()
+				for _, row := range cachedEvents {
+					var partitionID int64
+					if row.TableInfo.IsPartitionTable() {
+						partitionID = row.PhysicalTableID
+					}
+					tableID := c.fakeTableIDGenerator.
+						generateFakeTableID(row.TableInfo.GetSchemaName(), row.TableInfo.GetTableName(), partitionID)
+					row.TableInfo.TableName.TableID = tableID
+
+					group, ok := eventGroups[tableID]
+					if !ok {
+						group = newEventsGroup()
+						eventGroups[tableID] = group
+					}
+					group.Append(row)
+				}
+			}
+
+			// the Query maybe empty if using simple protocol, it's comes from `bootstrap` event.
+			if partition == 0 && ddl.Query != "" {
+				c.appendDDL(ddl)
+			}
+			// todo: mark the offset after the DDL is fully synced to the downstream mysql.
+			handleCallBack()
+		case model.MessageTypeRow:
+			row, err := decoder.NextRowChangedEvent()
+			if err != nil {
+				log.Panic("decode message value failed",
+					zap.ByteString("value", value),
+					zap.Error(err))
+			}
+			// when using simple protocol, the row may be nil, since it's table info not received yet,
+			// it's cached in the decoder, so just continue here.
+			if row == nil {
+				continue
+			}
+			target, _, err := c.eventRouter.GetPartitionForRowChange(row, c.option.partitionNum)
+			if err != nil {
+				return cerror.Trace(err)
+			}
+			if partition != target {
+				log.Panic("RowChangedEvent dispatched to wrong partition",
+					zap.Int32("obtained", partition),
+					zap.Int32("expected", target),
+					zap.Int32("partitionNum", c.option.partitionNum),
+					zap.Any("row", row),
+				)
+			}
+
+			globalResolvedTs := atomic.LoadUint64(&c.globalResolvedTs)
+			partitionResolvedTs := atomic.LoadUint64(&sink.resolvedTs)
+			if row.CommitTs <= globalResolvedTs || row.CommitTs <= partitionResolvedTs {
+				log.Warn("RowChangedEvent fallback row, ignore it",
+					zap.Uint64("commitTs", row.CommitTs),
+					zap.Uint64("globalResolvedTs", globalResolvedTs),
+					zap.Uint64("partitionResolvedTs", partitionResolvedTs),
+					zap.Int32("partition", partition),
+					zap.Any("row", row))
+				// todo: mark the offset after the DDL is fully synced to the downstream mysql.
+				// Need HACK
+				handleCallBack()
+				continue
+			}
+			var partitionID int64
+			if row.TableInfo.IsPartitionTable() {
+				partitionID = row.PhysicalTableID
+			}
+			tableID := c.fakeTableIDGenerator.
+				generateFakeTableID(row.TableInfo.GetSchemaName(), row.TableInfo.GetTableName(), partitionID)
+			row.TableInfo.TableName.TableID = tableID
+
+			group, ok := eventGroups[tableID]
+			if !ok {
+				group = newEventsGroup()
+				eventGroups[tableID] = group
+			}
+
+			group.Append(row)
+			// todo: mark the offset after the DDL is fully synced to the downstream mysql.
+			handleCallBack()
+		case model.MessageTypeResolved:
+			ts, err := decoder.NextResolvedEvent()
+			if err != nil {
+				log.Panic("decode message value failed",
+					zap.ByteString("value", value),
+					zap.Error(err))
+			}
+
+			globalResolvedTs := atomic.LoadUint64(&c.globalResolvedTs)
+			partitionResolvedTs := atomic.LoadUint64(&sink.resolvedTs)
+			if ts < globalResolvedTs || ts < partitionResolvedTs {
+				log.Warn("partition resolved ts fallback, skip it",
+					zap.Uint64("ts", ts),
+					zap.Uint64("partitionResolvedTs", partitionResolvedTs),
+					zap.Uint64("globalResolvedTs", globalResolvedTs),
+					zap.Int32("partition", partition))
+				handleCallBack()
+				continue
+			}
+
+			for tableID, group := range eventGroups {
+				events := group.Resolve(ts)
+				if len(events) == 0 {
+					continue
+				}
+				if _, ok := sink.tableSinksMap.Load(tableID); !ok {
+					sink.tableSinksMap.Store(tableID, c.sinkFactory.CreateTableSinkForConsumer(
+						model.DefaultChangeFeedID("kafka-consumer"),
+						spanz.TableIDToComparableSpan(tableID),
+						events[0].CommitTs,
+					))
+				}
+				s, _ := sink.tableSinksMap.Load(tableID)
+				s.(tablesink.TableSink).AppendRowChangedEvents(events...)
+				commitTs := events[len(events)-1].CommitTs
+				lastCommitTs, ok := sink.tablesCommitTsMap.Load(tableID)
+				if !ok || lastCommitTs.(uint64) < commitTs {
+					sink.tablesCommitTsMap.Store(tableID, commitTs)
+				}
+			}
+			atomic.StoreUint64(&sink.resolvedTs, ts)
+			// todo: mark the offset after the DDL is fully synced to the downstream mysql.
+			handleCallBack()
+		}
+
+	}
+
+	if counter > c.option.maxBatchSize {
+		log.Panic("Open Protocol max-batch-size exceeded", zap.Int("max-batch-size", c.option.maxBatchSize),
+			zap.Int("actual-batch-size", counter))
+	}
+	return nil
+}
+
+func (c *Consumer) KafkaConsume(partition int32, handleMessage func(HandleFunc) error) error {
+	c.sinksMu.Lock()
+	sink := c.sinks[partition]
+	c.sinksMu.Unlock()
+	if sink == nil {
+		panic("sink should initialized")
+	}
+
+	ctx := context.Background()
+	var (
+		decoder codec.RowEventDecoder
+		err     error
+	)
+	switch c.option.protocol {
+	case config.ProtocolOpen, config.ProtocolDefault:
+		decoder, err = open.NewBatchDecoder(ctx, c.option.codecConfig, c.upstreamTiDB)
+	case config.ProtocolCanalJSON:
+		decoder, err = canal.NewBatchDecoder(ctx, c.option.codecConfig, c.upstreamTiDB)
+		if err != nil {
+			return err
+		}
+	case config.ProtocolAvro:
+		schemaM, err := avro.NewConfluentSchemaManager(ctx, c.option.schemaRegistryURI, nil)
+		if err != nil {
+			return cerror.Trace(err)
+		}
+		decoder = avro.NewDecoder(c.option.codecConfig, schemaM, c.option.topic)
+	case config.ProtocolSimple:
+		decoder, err = simple.NewDecoder(ctx, c.option.codecConfig, c.upstreamTiDB)
+	default:
+		log.Panic("Protocol not supported", zap.Any("Protocol", c.option.protocol))
+	}
+	if err != nil {
+		return cerror.Trace(err)
+	}
+
+	eventGroups := make(map[int64]*eventsGroup)
+
+	err = handleMessage(func(key, val []byte, handleCallBack func()) error {
+		// log.Info("message key value", zap.String("key", string(key)), zap.String("value", string(val)))
+		return c.handleMessage(decoder, partition, sink, key, val, eventGroups, handleCallBack)
+	})
+	if err != nil {
+		return err
+	}
+	return nil
 }

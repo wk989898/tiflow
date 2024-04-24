@@ -13,33 +13,17 @@
 
 package main
 
-// // consumer_example implements a consumer using the non-channel Poll() API
-// // to retrieve messages and events.
+// consumer_example implements a consumer using the non-channel Poll() API
+// to retrieve messages and events.
 
-// import (
-// 	"fmt"
-// 	"os"
-// 	"os/signal"
-// 	"syscall"
-
-// 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-// )
-
-// func fn() {
-
-// 	if len(os.Args) < 4 {
-// 		fmt.Fprintf(os.Stderr, "Usage: %s <bootstrap-servers> <group> <topics..>\n",
-// 			os.Args[0])
-// 		os.Exit(1)
-// 	}
-
+// func ConfluentConsume() {
 // 	bootstrapServers := os.Args[1]
 // 	group := os.Args[2]
 // 	topics := os.Args[3:]
 // 	sigchan := make(chan os.Signal, 1)
 // 	signal.Notify(sigchan, syscall.SIGINT, syscall.SIGTERM)
 
-// 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
+// 	consumer, err := confluent.NewConsumer(&confluent.ConfigMap{
 // 		"bootstrap.servers": bootstrapServers,
 // 		// Avoid connecting to IPv6 brokers:
 // 		// This is needed for the ErrAllBrokersDown show-case below
@@ -56,15 +40,14 @@ package main
 // 		// Whether or not we store offsets automatically.
 // 		"enable.auto.offset.store": false,
 // 	})
-
+// 	defer consumer.Close()
 // 	if err != nil {
 // 		fmt.Fprintf(os.Stderr, "Failed to create consumer: %s\n", err)
-// 		os.Exit(1)
 // 	}
 
-// 	fmt.Printf("Created Consumer %v\n", c)
+// 	fmt.Printf("Created Consumer %v\n", consumer)
 
-// 	err = c.SubscribeTopics(topics, nil)
+// 	err = consumer.SubscribeTopics(topics, nil)
 
 // 	run := true
 
@@ -74,13 +57,13 @@ package main
 // 			fmt.Printf("Caught signal %v: terminating\n", sig)
 // 			run = false
 // 		default:
-// 			ev := c.Poll(100)
+// 			ev := consumer.Poll(100)
 // 			if ev == nil {
 // 				continue
 // 			}
 
 // 			switch e := ev.(type) {
-// 			case *kafka.Message:
+// 			case *confluent.Message:
 // 				// Process the message received.
 // 				fmt.Printf("%% Message on %s:\n%s\n",
 // 					e.TopicPartition, string(e.Value))
@@ -95,19 +78,19 @@ package main
 // 				// if enable.auto.commit isn't set to false (the default is true).
 // 				// By storing the offsets manually after completely processing
 // 				// each message, we can ensure atleast once processing.
-// 				_, err := c.StoreMessage(e)
+// 				_, err := consumer.StoreMessage(e)
 // 				if err != nil {
 // 					fmt.Fprintf(os.Stderr, "%% Error storing offset after message %s:\n",
 // 						e.TopicPartition)
 // 				}
-// 			case kafka.Error:
+// 			case confluent.Error:
 // 				// Errors should generally be considered
 // 				// informational, the client will try to
 // 				// automatically recover.
 // 				// But in this example we choose to terminate
 // 				// the application if all brokers are down.
 // 				fmt.Fprintf(os.Stderr, "%% Error: %v: %v\n", e.Code(), e)
-// 				if e.Code() == kafka.ErrAllBrokersDown {
+// 				if e.Code() == confluent.ErrAllBrokersDown {
 // 					run = false
 // 				}
 // 			default:
@@ -117,5 +100,4 @@ package main
 // 	}
 
 // 	fmt.Printf("Closing consumer\n")
-// 	c.Close()
 // }
