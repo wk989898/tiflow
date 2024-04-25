@@ -16,7 +16,6 @@ package main
 import (
 	"context"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -26,11 +25,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func newConsumerGroup(consumerOption *consumerOption, config *sarama.Config) (sarama.ConsumerGroup, error) {
-	return sarama.NewConsumerGroup(consumerOption.address, consumerOption.groupID, config)
-}
-
-func newConfig(o *consumerOption) (*sarama.Config, error) {
+func newConfig(o *ConsumerOption) (*sarama.Config, error) {
 	config := sarama.NewConfig()
 
 	version, err := sarama.ParseKafkaVersion(o.version)
@@ -81,30 +76,7 @@ func saramWaitTopicCreated(address []string, topic string, cfg *sarama.Config) e
 	return cerror.Errorf("wait the topic(%s) created timeout", topic)
 }
 
-func (c *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	partition := claim.Partition()
-	log.Info("start consume claim",
-		zap.String("topic", claim.Topic()), zap.Int32("partition", partition),
-		zap.Int64("initialOffset", claim.InitialOffset()), zap.Int64("highWaterMarkOffset", claim.HighWaterMarkOffset()))
-
-	// TODO: mark the offset after the DDL is fully synced to the downstream mysql
-	markMsg := func(message *sarama.ConsumerMessage) func() {
-		return func() {
-			session.MarkMessage(message, "")
-		}
-	}
-	return c.KafkaConsume(partition, func(handle HandleFunc) error {
-		for message := range claim.Messages() {
-			err := handle(message.Key, message.Value, markMsg(message))
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-func SaramGetPartitionNum(address []string, topic string) (int32, error) {
+func saramGetPartitionNum(address []string, topic string) (int32, error) {
 	saramaConfig := sarama.NewConfig()
 	// get partition number or create topic automatically
 	admin, err := sarama.NewClusterAdmin(address, saramaConfig)
@@ -129,35 +101,79 @@ func SaramGetPartitionNum(address []string, topic string) (int32, error) {
 	return topicDetail.NumPartitions, nil
 }
 
+type SaramConsumer struct {
+	ready  chan bool
+	option *ConsumerOption
+	config *sarama.Config
+	writer *Writer
+}
+
+var _ KakfaConsumer = (*SaramConsumer)(nil)
+
+func NewSaramConsumer(ctx context.Context, o *ConsumerOption) KakfaConsumer {
+	c := new(SaramConsumer)
+	w, err := NewWriter(ctx, o)
+	if err != nil {
+		log.Panic("Error creating writer", zap.Error(err))
+	}
+	c.writer = w
+	if o.partitionNum != 0 {
+		partitionNum, err := saramGetPartitionNum(o.address, o.topic)
+		if err != nil {
+			log.Panic("can not get partition number", zap.String("topic", o.topic), zap.Error(err))
+		}
+		o.partitionNum = partitionNum
+	}
+	c.option = o
+
+	c.ready = make(chan bool)
+	config, err := newConfig(o)
+
+	if err != nil {
+		log.Panic("Error creating sarama config", zap.Error(err))
+	}
+	c.config = config
+	err = saramWaitTopicCreated(o.address, o.topic, config)
+	// wait topic create
+	if err != nil {
+		log.Panic("wait topic created failed", zap.Error(err))
+	}
+	return c
+}
+
 // Setup is run at the beginning of a new session, before ConsumeClaim
-func (c *Consumer) Setup(sarama.ConsumerGroupSession) error {
+func (c *SaramConsumer) Setup(sarama.ConsumerGroupSession) error {
 	// Mark the c as ready
 	close(c.ready)
 	return nil
 }
 
 // Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
-func (c *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
+func (c *SaramConsumer) Cleanup(sarama.ConsumerGroupSession) error {
 	return nil
 }
 
-// /**
-// * Construct a new Sarama configuration.
-// * The Kafka cluster version has to be defined before the consumer/producer is initialized.
-// */
-func SaramConsume(ctx context.Context, consumer *Consumer, wg *sync.WaitGroup) {
-	consumerOption := consumer.option
-	config, err := newConfig(consumerOption) // need change
-	if err != nil {
-		log.Panic("Error creating sarama config", zap.Error(err))
+// async read message from Kafka
+func (c *SaramConsumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	partition := claim.Partition()
+	log.Info("start consume claim",
+		zap.String("topic", claim.Topic()), zap.Int32("partition", partition),
+		zap.Int64("initialOffset", claim.InitialOffset()), zap.Int64("highWaterMarkOffset", claim.HighWaterMarkOffset()))
+	eventGroups := make(map[int64]*EventsGroup)
+	for message := range claim.Messages() {
+		if err := c.writer.Decode(context.Background(), c.option, partition, message.Key, message.Value, eventGroups); err != nil {
+			return err
+		}
 	}
-	// wait topic create
-	err = saramWaitTopicCreated(consumerOption.address, consumerOption.topic, config)
-	if err != nil {
-		log.Panic("wait topic created failed", zap.Error(err))
-	}
-
-	client, err := newConsumerGroup(consumerOption, config)
+	// write to downstream
+	// if err := c.writer.Write(context.Background()); err != nil {
+	// 	log.Panic("Error write to downstream", zap.Error(err))
+	// }
+	// session.MarkMessage(message, "")
+	return nil
+}
+func (c *SaramConsumer) Consume(ctx context.Context) error {
+	client, err := sarama.NewConsumerGroup(c.option.address, c.option.groupID, c.config)
 	if err != nil {
 		log.Panic("Error creating consumer group client", zap.Error(err))
 	}
@@ -167,19 +183,23 @@ func SaramConsume(ctx context.Context, consumer *Consumer, wg *sync.WaitGroup) {
 			log.Panic("Error closing client", zap.Error(err))
 		}
 	}()
-	defer wg.Done()
 
 	for {
 		// `consume` should be called inside an infinite loop, when a
 		// server-side rebalance happens, the consumer session will need to be
 		// recreated to get the new claims
-		if err := client.Consume(ctx, strings.Split(consumerOption.topic, ","), consumer); err != nil {
+		if err := client.Consume(ctx, strings.Split(c.option.topic, ","), c); err != nil {
 			log.Panic("Error from consumer", zap.Error(err))
 		}
 		// check if context was cancelled, signaling that the consumer should stop
 		if ctx.Err() != nil {
-			return
+			return ctx.Err()
 		}
-		consumer.ready = make(chan bool)
+		c.ready = make(chan bool)
 	}
+}
+
+// async write to downsteam
+func (c *SaramConsumer) AsyncWrite(ctx context.Context) {
+	c.writer.AsyncWrite(ctx)
 }
