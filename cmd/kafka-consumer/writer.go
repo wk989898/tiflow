@@ -283,54 +283,50 @@ func (w *Writer) AsyncWrite(ctx context.Context) error {
 }
 
 func (w *Writer) Write(ctx context.Context) error {
-	for {
-		minPartitionResolvedTs, err := w.getMinPartitionResolvedTs()
-		if err != nil {
-			return cerror.Trace(err)
-		}
-		// handle DDL
-		todoDDL := w.getFrontDDL()
+	minPartitionResolvedTs, err := w.getMinPartitionResolvedTs()
+	if err != nil {
+		return cerror.Trace(err)
+	}
+	// handle DDL
+	todoDDL := w.getFrontDDL()
 
-		if todoDDL != nil && todoDDL.CommitTs <= minPartitionResolvedTs {
-			// flush DMLs
-			if err := w.forEachSink(func(sink *partitionSinks) error {
-				return syncFlushRowChangedEvents(ctx, sink, todoDDL.CommitTs)
-			}); err != nil {
-				return cerror.Trace(err)
-			}
-			// DDL can be executed, do it first.
-			if err := w.ddlSink.WriteDDLEvent(ctx, todoDDL); err != nil {
-				return cerror.Trace(err)
-			}
-			w.popDDL()
-			if todoDDL.CommitTs < minPartitionResolvedTs {
-				log.Info("update minPartitionResolvedTs by DDL",
-					zap.Uint64("minPartitionResolvedTs", minPartitionResolvedTs),
-					zap.String("DDL", todoDDL.Query))
-			}
-			minPartitionResolvedTs = todoDDL.CommitTs
-		}
-
-		// update global resolved ts
-		if w.globalResolvedTs > minPartitionResolvedTs {
-			log.Panic("global ResolvedTs fallback",
-				zap.Uint64("globalResolvedTs", w.globalResolvedTs),
-				zap.Uint64("minPartitionResolvedTs", minPartitionResolvedTs))
-		}
-
-		if w.globalResolvedTs < minPartitionResolvedTs {
-			w.globalResolvedTs = minPartitionResolvedTs
-		}
-
+	if todoDDL != nil && todoDDL.CommitTs <= minPartitionResolvedTs {
+		// flush DMLs
 		if err := w.forEachSink(func(sink *partitionSinks) error {
-			return syncFlushRowChangedEvents(ctx, sink, w.globalResolvedTs)
+			return syncFlushRowChangedEvents(ctx, sink, todoDDL.CommitTs)
 		}); err != nil {
 			return cerror.Trace(err)
 		}
-		if todoDDL == nil {
-			return nil
+		// DDL can be executed, do it first.
+		if err := w.ddlSink.WriteDDLEvent(ctx, todoDDL); err != nil {
+			return cerror.Trace(err)
 		}
+		w.popDDL()
+		if todoDDL.CommitTs < minPartitionResolvedTs {
+			log.Info("update minPartitionResolvedTs by DDL",
+				zap.Uint64("minPartitionResolvedTs", minPartitionResolvedTs),
+				zap.String("DDL", todoDDL.Query))
+		}
+		minPartitionResolvedTs = todoDDL.CommitTs
 	}
+
+	// update global resolved ts
+	if w.globalResolvedTs > minPartitionResolvedTs {
+		log.Panic("global ResolvedTs fallback",
+			zap.Uint64("globalResolvedTs", w.globalResolvedTs),
+			zap.Uint64("minPartitionResolvedTs", minPartitionResolvedTs))
+	}
+
+	if w.globalResolvedTs < minPartitionResolvedTs {
+		w.globalResolvedTs = minPartitionResolvedTs
+	}
+
+	if err := w.forEachSink(func(sink *partitionSinks) error {
+		return syncFlushRowChangedEvents(ctx, sink, w.globalResolvedTs)
+	}); err != nil {
+		return cerror.Trace(err)
+	}
+	return nil
 }
 
 func (w *Writer) Decode(ctx context.Context, option *ConsumerOption, partition int32, key []byte, value []byte, eventGroups map[int64]*EventsGroup) error {
@@ -443,9 +439,6 @@ func (w *Writer) Decode(ctx context.Context, option *ConsumerOption, partition i
 					zap.Uint64("partitionResolvedTs", partitionResolvedTs),
 					zap.Int32("partition", partition),
 					zap.Any("row", row))
-				// todo: mark the offset after the DDL is fully synced to the downstream mysql.
-				// Need HACK
-				// handleCallBack()
 				continue
 			}
 			var partitionID int64

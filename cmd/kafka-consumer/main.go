@@ -91,8 +91,9 @@ func main() {
 		log.Panic("adjust consumer option failed", zap.Error(err))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	consumer := NewSaramConsumer(ctx, consumerOption)
-	go consumer.AsyncWrite(ctx)
+	// consumer := NewSaramConsumer(ctx, consumerOption)
+	consumer := NewkafkaGoConsumer(ctx, consumerOption)
+	// go consumer.AsyncWrite(ctx)
 
 	var wg sync.WaitGroup
 	if consumerOption.enableProfiling {

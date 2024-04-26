@@ -164,14 +164,15 @@ func (c *SaramConsumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim 
 		if err := c.writer.Decode(context.Background(), c.option, partition, message.Key, message.Value, eventGroups); err != nil {
 			return err
 		}
+		// sync write to downstream
+		if err := c.writer.Write(context.Background()); err != nil {
+			log.Panic("Error write to downstream", zap.Error(err))
+		}
+		session.MarkMessage(message, "")
 	}
-	// write to downstream
-	// if err := c.writer.Write(context.Background()); err != nil {
-	// 	log.Panic("Error write to downstream", zap.Error(err))
-	// }
-	// session.MarkMessage(message, "")
 	return nil
 }
+
 func (c *SaramConsumer) Consume(ctx context.Context) error {
 	client, err := sarama.NewConsumerGroup(c.option.address, c.option.groupID, c.config)
 	if err != nil {
