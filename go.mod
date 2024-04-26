@@ -21,6 +21,7 @@ require (
 	github.com/chaos-mesh/go-sqlsmith v0.0.0-20220905074648-403033efad45
 	github.com/chzyer/readline v1.5.1
 	github.com/cockroachdb/pebble v0.0.0-20220415182917-06c9d3be25b3
+	github.com/confluentinc/confluent-kafka-go/v2 v2.3.0
 	github.com/coreos/go-semver v0.3.1
 	github.com/deepmap/oapi-codegen v1.9.0
 	github.com/dgrijalva/jwt-go v3.2.0+incompatible

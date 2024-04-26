@@ -15,8 +15,6 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"os"
 	"strings"
 
 	confluent "github.com/confluentinc/confluent-kafka-go/v2/kafka"
@@ -56,6 +54,7 @@ func confluentGetPartitionNum(address []string, topic string) (int32, error) {
 	// 	zap.String("topic", topic),
 	// 	zap.Int32("partitionNum", numPartitions))
 	// return numPartitions, nil
+	return 0, nil
 }
 
 func confluentWaitTopicCreated(address []string, topic string) error {
@@ -80,27 +79,7 @@ func confluentWaitTopicCreated(address []string, topic string) error {
 	// 	time.Sleep(1 * time.Second)
 	// }
 	// return cerror.Errorf("wait the topic(%s) created timeout", topic)
-
-}
-
-func ConfluentConsume() {
-	// bootstrapServers := os.Args[1]
-	// group := os.Args[2]
-	// topics := os.Args[3:]
-	// sigchan := make(chan os.Signal, 1)
-	// signal.Notify(sigchan, syscall.SIGINT, syscall.SIGTERM)
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create consumer: %s\n", err)
-	}
-
-	fmt.Printf("Created Consumer %v\n", consumer)
-
-	err = consumer.SubscribeTopics(topics, nil)
-
-	run := true
-
-	fmt.Printf("Closing consumer\n")
+	return nil
 }
 
 type ConfluentConsumer struct {
@@ -170,6 +149,7 @@ func (c *ConfluentConsumer) Consume(ctx context.Context) error {
 			log.Panic("Error closing client", zap.Error(err))
 		}
 	}()
+	return nil
 }
 
 // async write to downsteam
