@@ -225,12 +225,14 @@ func (b *DefaultBroker) createResource(
 
 // OnWorkerClosed implements Broker.OnWorkerClosed
 func (b *DefaultBroker) OnWorkerClosed(ctx context.Context, workerID resModel.WorkerID, jobID resModel.JobID) {
+	timer := time.NewTimer(defaultTimeout)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return
 	case b.closedWorkerCh <- closedWorker{workerID: workerID, jobID: jobID}:
 		return
-	case <-time.After(defaultTimeout):
+	case <-timer.C:
 		log.Error("closed worker channel is full, broker may be stuck")
 	}
 }

@@ -91,6 +91,8 @@ type resignReq struct {
 func (e *electorImpl) RunElection(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	timer := time.NewTimer(e.config.RenewInterval)
+	defer timer.Stop()
 	for {
 		if err := e.renew(ctx); err != nil {
 			log.Warn("failed to renew lease after renew deadline", zap.Error(err),
@@ -127,7 +129,7 @@ func (e *electorImpl) RunElection(ctx context.Context) error {
 				req.errCh <- nil
 				e.resignUntil = time.Now().Add(req.duration)
 			}
-		case <-time.After(e.config.RenewInterval):
+		case <-timer.C:
 		}
 	}
 }

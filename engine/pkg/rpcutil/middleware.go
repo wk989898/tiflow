@@ -161,7 +161,7 @@ func waitForLeader[T any](ctx context.Context, fc ForwardChecker[T]) (leaderCli 
 			if !errors.Is(err, errors.ErrMasterNoLeader) {
 				return leaderCli, err
 			}
-		case <-time.After(waitForLeaderTimeout):
+		case <-timer.C:
 			return leaderCli, errors.ErrMasterNoLeader.GenWithStackByArgs()
 		}
 	}

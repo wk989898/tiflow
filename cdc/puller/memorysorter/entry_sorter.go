@@ -83,12 +83,14 @@ func (es *EntrySorter) Run(ctx context.Context) error {
 	errg.Go(func() error {
 		var sorted []*model.PolymorphicEvent
 		for {
+			timer := time.NewTimer(defaultMetricInterval)
+			defer timer.Stop()
 			select {
 			case <-ctx.Done():
 				atomic.StoreInt32(&es.closed, 1)
 				close(es.outputCh)
 				return errors.Trace(ctx.Err())
-			case <-time.After(defaultMetricInterval):
+			case <-timer.C:
 				metricEntrySorterOutputChanSizeGauge.Set(float64(len(es.outputCh)))
 				es.lock.Lock()
 				metricEntrySorterResolvedChanSizeGauge.Set(float64(len(es.resolvedTsGroup)))

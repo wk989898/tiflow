@@ -742,11 +742,13 @@ func (s *Server) reportTaskResc(ctx context.Context) error {
 }
 
 func (s *Server) bgUpdateServerMasterClients(ctx context.Context) error {
+	timer := time.NewTimer(defaultDiscoveryAutoSyncInterval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return errors.Trace(ctx.Err())
-		case <-time.After(defaultDiscoveryAutoSyncInterval):
+		case <-timer.C:
 			masters, err := s.masterClient.ListMasters(ctx)
 			if err != nil {
 				log.Warn("update master list error", zap.Error(err))

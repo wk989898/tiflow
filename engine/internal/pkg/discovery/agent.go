@@ -131,6 +131,8 @@ func (a *agentImpl) Run(ctx context.Context) error {
 
 func (a *agentImpl) autoSync(ctx context.Context) error {
 	snap := make(Snapshot)
+	timer := time.NewTimer(a.autoSyncInterval)
+	defer timer.Stop()
 	for {
 		newSnap, err := a.getSnapshot(ctx)
 		if err != nil {
@@ -153,7 +155,7 @@ func (a *agentImpl) autoSync(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return errors.Trace(ctx.Err())
-		case <-time.After(a.autoSyncInterval):
+		case <-timer.C:
 		}
 	}
 }
