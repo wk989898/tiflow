@@ -14,117 +14,231 @@
 package codec
 
 import (
-	"bytes"
 	"context"
+	"sync/atomic"
+	"time"
 
+	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
+	"github.com/pingcap/tidb/pkg/util/cpu"
 	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/cdc/sink/dmlsink"
+	"github.com/pingcap/tiflow/pkg/config"
 	"github.com/pingcap/tiflow/pkg/sink/codec/common"
+	"github.com/pingcap/tiflow/pkg/util"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
-	// BatchVersion1 represents the version of batch format
-	BatchVersion1 uint64 = 1
-
-	// MemBufShrinkThreshold represents the threshold of shrinking the buffer.
-	MemBufShrinkThreshold = 1024 * 1024
+	defaultInputChanSize  = 128
+	defaultMetricInterval = 15 * time.Second
 )
 
-// DDLEventBatchEncoder is an abstraction for DDL event encoder.
-type DDLEventBatchEncoder interface {
-	// EncodeCheckpointEvent appends a checkpoint event into the batch.
-	// This event will be broadcast to all partitions to signal a global checkpoint.
-	EncodeCheckpointEvent(ts uint64) (*common.Message, error)
-	// EncodeDDLEvent appends a DDL event into the batch
-	EncodeDDLEvent(e *model.DDLEvent) (*common.Message, error)
+// EncoderGroup manages a group of encoders
+type EncoderGroup interface {
+	// Run start the group
+	Run(ctx context.Context) error
+	// AddEvents add events into the group and encode them by one of the encoders in the group.
+	// Note: The caller should make sure all events should belong to the same topic and partition.
+	AddEvents(ctx context.Context, key model.TopicPartitionKey, events ...*dmlsink.RowChangeCallbackableEvent) error
+	// Output returns a channel produce futures
+	Output() <-chan *future
 }
 
-// MessageBuilder is an abstraction to build message.
-type MessageBuilder interface {
-	// Build builds the batch and returns the bytes of key and value.
-	// Should be called after `AppendRowChangedEvent`
-	Build() []*common.Message
+type encoderGroup struct {
+	changefeedID model.ChangeFeedID
+
+	builder RowEventEncoderBuilder
+	// concurrency is the number of encoder pipelines to run
+	concurrency int
+	// inputCh is the input channel for each encoder pipeline
+	inputCh []chan *future
+	index   uint64
+
+	outputCh        chan *future
+	bootstrapWorker *bootstrapWorker
 }
 
-// RowEventEncoder is an abstraction for events encoder
-type RowEventEncoder interface {
-	DDLEventBatchEncoder
-	// AppendRowChangedEvent appends a row changed event into the batch or buffer.
-	AppendRowChangedEvent(context.Context, string, *model.RowChangedEvent, func()) error
-	MessageBuilder
-}
+// NewEncoderGroup creates a new EncoderGroup instance
+func NewEncoderGroup(
+	cfg *config.SinkConfig,
+	builder RowEventEncoderBuilder,
+	changefeedID model.ChangeFeedID,
+) *encoderGroup {
+	concurrency := util.GetOrZero(cfg.EncoderConcurrency)
+	if concurrency <= 0 {
+		concurrency = config.DefaultEncoderGroupConcurrency
+	}
+	// limit concurrency to avoid OOM
+	if concurrency >= cpu.GetCPUCount()*10 {
+		concurrency = cpu.GetCPUCount() * 10
+	}
+	inputCh := make([]chan *future, concurrency)
+	for i := 0; i < concurrency; i++ {
+		inputCh[i] = make(chan *future, defaultInputChanSize)
+	}
+	outCh := make(chan *future, defaultInputChanSize*concurrency)
 
-// RowEventEncoderBuilder builds row encoder with context.
-type RowEventEncoderBuilder interface {
-	Build() RowEventEncoder
-	CleanMetrics()
-}
-
-// TxnEventEncoder is an abstraction for txn events encoder.
-type TxnEventEncoder interface {
-	// AppendTxnEvent append a txn event into the buffer.
-	AppendTxnEvent(*model.SingleTableTxn, func()) error
-	MessageBuilder
-}
-
-// TxnEventEncoderBuilder builds txn encoder with context.
-type TxnEventEncoderBuilder interface {
-	Build() TxnEventEncoder
-}
-
-// IsColumnValueEqual checks whether the preValue and updatedValue are equal.
-func IsColumnValueEqual(preValue, updatedValue interface{}) bool {
-	if preValue == nil || updatedValue == nil {
-		return preValue == updatedValue
+	var bootstrapWorker *bootstrapWorker
+	if cfg.ShouldSendBootstrapMsg() {
+		bootstrapWorker = newBootstrapWorker(
+			changefeedID,
+			outCh,
+			builder.Build(),
+			util.GetOrZero(cfg.SendBootstrapIntervalInSec),
+			util.GetOrZero(cfg.SendBootstrapInMsgCount),
+			util.GetOrZero(cfg.SendBootstrapToAllPartition),
+			defaultMaxInactiveDuration,
+		)
 	}
 
-	preValueBytes, ok1 := preValue.([]byte)
-	updatedValueBytes, ok2 := updatedValue.([]byte)
-	if ok1 && ok2 {
-		return bytes.Equal(preValueBytes, updatedValueBytes)
+	return &encoderGroup{
+		changefeedID:    changefeedID,
+		builder:         builder,
+		concurrency:     concurrency,
+		inputCh:         inputCh,
+		index:           0,
+		outputCh:        outCh,
+		bootstrapWorker: bootstrapWorker,
 	}
-	// mounter use the same table info to parse the value,
-	// the value type should be the same
-	return preValue == updatedValue
 }
 
-// MockRowEventEncoderBuilder is a mock implementation of RowEventEncoderBuilder
-type MockRowEventEncoderBuilder struct{}
+func (g *encoderGroup) Run(ctx context.Context) error {
+	defer func() {
+		g.cleanMetrics()
+		log.Info("encoder group exited",
+			zap.String("namespace", g.changefeedID.Namespace),
+			zap.String("changefeed", g.changefeedID.ID))
+	}()
+	eg, ctx := errgroup.WithContext(ctx)
+	for i := 0; i < g.concurrency; i++ {
+		idx := i
+		eg.Go(func() error {
+			return g.runEncoder(ctx, idx)
+		})
+	}
+	eg.Go(func() error {
+		return g.collectMetrics(ctx)
+	})
 
-// Build implement the RowEventEncoderBuilder interface
-func (m *MockRowEventEncoderBuilder) Build() RowEventEncoder {
-	return &MockRowEventEncoder{}
+	if g.bootstrapWorker != nil {
+		eg.Go(func() error {
+			return g.bootstrapWorker.run(ctx)
+		})
+	}
+
+	return eg.Wait()
 }
 
-// CleanMetrics implement the RowEventEncoderBuilder interface
-func (m *MockRowEventEncoderBuilder) CleanMetrics() {
-	// Clean up metrics if needed
+func (g *encoderGroup) collectMetrics(ctx context.Context) error {
+	ticker := time.NewTicker(defaultMetricInterval)
+	inputChSize := encoderGroupInputChanSizeGauge.WithLabelValues(g.changefeedID.Namespace, g.changefeedID.ID)
+	outputChSize := encoderGroupOutputChanSizeGauge.WithLabelValues(g.changefeedID.Namespace, g.changefeedID.ID)
+	defer func() {
+		ticker.Stop()
+		encoderGroupInputChanSizeGauge.DeleteLabelValues(g.changefeedID.Namespace, g.changefeedID.ID)
+		encoderGroupOutputChanSizeGauge.DeleteLabelValues(g.changefeedID.Namespace, g.changefeedID.ID)
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			var total int
+			for _, ch := range g.inputCh {
+				total += len(ch)
+			}
+			inputChSize.Set(float64(total))
+			outputChSize.Set(float64(len(g.outputCh)))
+		}
+	}
 }
 
-// MockRowEventEncoder is a mock implementation of RowEventEncoder
-type MockRowEventEncoder struct{}
-
-// EncodeCheckpointEvent implement the DDLEventBatchEncoder interface
-func (m *MockRowEventEncoder) EncodeCheckpointEvent(ts uint64) (*common.Message, error) {
-	// Implement the encoding logic for checkpoint event
-	return nil, nil
+func (g *encoderGroup) runEncoder(ctx context.Context, idx int) error {
+	encoder := g.builder.Build()
+	inputCh := g.inputCh[idx]
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case future := <-inputCh:
+			for _, event := range future.events {
+				err := encoder.AppendRowChangedEvent(ctx, future.Key.Topic, event.Event, event.Callback)
+				if err != nil {
+					return errors.Trace(err)
+				}
+			}
+			future.Messages = encoder.Build()
+			close(future.done)
+		}
+	}
 }
 
-// EncodeDDLEvent implement the DDLEventBatchEncoder interface
-func (m *MockRowEventEncoder) EncodeDDLEvent(e *model.DDLEvent) (*common.Message, error) {
-	// Implement the encoding logic for DDL event
-	return nil, nil
-}
-
-// AppendRowChangedEvent implement the RowEventEncoder interface
-func (m *MockRowEventEncoder) AppendRowChangedEvent(
-	ctx context.Context, tableID string, event *model.RowChangedEvent, callback func(),
+func (g *encoderGroup) AddEvents(
+	ctx context.Context,
+	key model.TopicPartitionKey,
+	events ...*dmlsink.RowChangeCallbackableEvent,
 ) error {
-	// Implement the logic for appending row changed event
+	// bootstrapWorker only not nil when the protocol is simple
+	if g.bootstrapWorker != nil {
+		err := g.bootstrapWorker.addEvent(ctx, key, events[0].Event)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	future := newFuture(key, events...)
+	index := atomic.AddUint64(&g.index, 1) % uint64(g.concurrency)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case g.inputCh[index] <- future:
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case g.outputCh <- future:
+	}
+
 	return nil
 }
 
-// Build implement the RowEventEncoder interface
-func (m *MockRowEventEncoder) Build() []*common.Message {
-	// Implement the logic for building the batch and returning the bytes of key and value
+func (g *encoderGroup) Output() <-chan *future {
+	return g.outputCh
+}
+
+func (g *encoderGroup) cleanMetrics() {
+	g.builder.CleanMetrics()
+	common.CleanMetrics(g.changefeedID)
+}
+
+// future is a wrapper of the result of encoding events
+// It's used to notify the caller that the result is ready.
+type future struct {
+	Key      model.TopicPartitionKey
+	events   []*dmlsink.RowChangeCallbackableEvent
+	Messages []*common.Message
+	done     chan struct{}
+}
+
+func newFuture(key model.TopicPartitionKey,
+	events ...*dmlsink.RowChangeCallbackableEvent,
+) *future {
+	return &future{
+		Key:    key,
+		events: events,
+		done:   make(chan struct{}),
+	}
+}
+
+// Ready waits until the response is ready, should be called before consuming the future.
+func (p *future) Ready(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.done:
+	}
 	return nil
 }
