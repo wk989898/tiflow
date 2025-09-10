@@ -214,7 +214,7 @@ func isLZ4Compressed(data []byte) bool {
 	return bytes.Equal(data[:4], lz4MagicNumber)
 }
 
-func readAllFromBuffer(buf []byte) (logHeap, error) {
+func readAllFromBuffer(buf []byte, fileName string) (logHeap, error) {
 	r := &reader{
 		br: bytes.NewReader(buf),
 	}
@@ -230,6 +230,7 @@ func readAllFromBuffer(buf []byte) (logHeap, error) {
 			break
 		}
 		h = append(h, &logWithIdx{data: rl})
+		log.Error("readAllFromBuffer", zap.Any("CommitTs", rl.GetCommitTs()), zap.Any("fileName", fileName), zap.Any("data", rl))
 	}
 
 	return h, nil
@@ -270,7 +271,7 @@ func sortAndWriteFile(
 	}
 
 	// sort data
-	h, err := readAllFromBuffer(fileContent)
+	h, err := readAllFromBuffer(fileContent, fileName)
 	if err != nil {
 		return err
 	}
@@ -282,7 +283,7 @@ func sortAndWriteFile(
 			// If the commitTs is greater than endTs, we should stop sorting
 			// and ignore the rest of the logs.
 			log.Info("ignore logs which commitTs is greater than resolvedTs",
-				zap.Any("filename", fileName), zap.Uint64("endTs", cfg.endTs))
+				zap.Any("filename", fileName), zap.Uint64("endTs", cfg.endTs), zap.Any("item", item.GetCommitTs()))
 			break
 		}
 		if item.GetCommitTs() <= cfg.startTs {
